@@ -2,16 +2,14 @@
 SS2D – Selective Scan 2D (Vision Mamba core).
 
 Uses the official ``mamba_ssm`` CUDA kernel when available (10-50× faster).
-Falls back to a pure-PyTorch parallel prefix scan otherwise.
+Falls back to a memory-efficient sequential scan in pure PyTorch otherwise.
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-# --------------- try to import CUDA selective scan from mamba_ssm -----------
 try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
     HAS_MAMBA_CUDA = True
@@ -21,22 +19,20 @@ except ImportError:
 
 
 # --------------------------------------------------------------------------- #
-#  Fallback: parallel prefix scan for  y_t = a_t · y_{t-1} + b_t
+#  Fallback: memory-efficient sequential scan  h_t = a_t · h_{t-1} + b_t
+#  Uses O(M) extra memory vs O(M·L·logL) for the parallel prefix scan.
 # --------------------------------------------------------------------------- #
 
-def _parallel_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    L = a.shape[-1]
-    num_steps = int(math.ceil(math.log2(max(L, 2))))
-    aa, bb = a.clone(), b.clone()
-    for k in range(num_steps):
-        s = 1 << k
-        if s >= L:
-            break
-        aa_prev = F.pad(aa[..., :-s], (s, 0), value=1.0)
-        bb_prev = F.pad(bb[..., :-s], (s, 0), value=0.0)
-        bb = aa * bb_prev + bb
-        aa = aa * aa_prev
-    return bb
+@torch.jit.script
+def _sequential_scan(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """JIT-compiled sequential linear recurrence."""
+    out = torch.empty_like(b)
+    h = b[..., 0]
+    out[..., 0] = h
+    for t in range(1, a.shape[-1]):
+        h = a[..., t] * h + b[..., t]
+        out[..., t] = h
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -110,14 +106,12 @@ class SS2D(nn.Module):
         dts = torch.einsum('kblr, ker -> kble',
                            dts, self.dt_proj_weight)
         dts = dts + self.dt_proj_bias[:, None, None, :]
-        # NOTE: softplus is deferred — CUDA kernel fuses it; fallback applies it
 
         A = -torch.exp(self.A_log)
 
-        # --- batched selective scan (all 4 dirs at once) ---
         use_cuda = HAS_MAMBA_CUDA and x.is_cuda
         ys = self._scan_batched_cuda(xs, dts, A, Bs, Cs) if use_cuda \
-            else self._scan_batched_pytorch(xs, F.softplus(dts), A, Bs, Cs)
+            else self._scan_sequential_pytorch(xs, F.softplus(dts), A, Bs, Cs)
 
         # --- reverse the reversed directions & merge ---
         ys[1] = ys[1].flip(-1)
@@ -152,25 +146,33 @@ class SS2D(nn.Module):
         )
         return list(rearrange(y, '(k b) e l -> k b e l', k=K).unbind(0))
 
-    # =================== PyTorch fallback (parallel scan) ================== #
-    def _scan_batched_pytorch(self, xs, dts, A, Bs, Cs):
-        """Pure-PyTorch batched scan using parallel prefix doubling."""
+    # ============= PyTorch fallback (sequential, memory-efficient) ========= #
+    def _scan_sequential_pytorch(self, xs, dts, A, Bs, Cs):
+        """Process each direction one at a time to minimize peak GPU memory."""
         K, B, E, L = xs.shape
         N = A.shape[1]
+        D_skip = self.D_skip.unsqueeze(0).unsqueeze(-1)
+        results = []
 
-        u = rearrange(xs, 'k b e l -> (k b) e l')
-        dt = rearrange(dts, 'k b l e -> (k b) e l')
-        B_t = rearrange(Bs, 'k b l n -> (k b) l n')
-        C_t = rearrange(Cs, 'k b l n -> (k b) l n')
+        for k in range(K):
+            u = xs[k]                          # (B, E, L)
+            dt = dts[k].permute(0, 2, 1)       # (B, E, L)
+            B_t = Bs[k]                        # (B, L, N)
+            C_t = Cs[k]                        # (B, L, N)
 
-        deltaA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(2))
-        deltaBx = (dt * u).unsqueeze(-1) * B_t.unsqueeze(1)
+            deltaA = torch.exp(
+                dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(2))   # (B,E,L,N)
+            deltaBx = (dt * u).unsqueeze(-1) * B_t.unsqueeze(1)   # (B,E,L,N)
 
-        a = rearrange(deltaA, 'b e l n -> (b e n) l')
-        b = rearrange(deltaBx, 'b e l n -> (b e n) l')
-        h = _parallel_scan(a, b)
-        h = rearrange(h, '(b e n) l -> b e l n', b=K * B, e=E, n=N)
+            a = rearrange(deltaA, 'b e l n -> (b e n) l')
+            bv = rearrange(deltaBx, 'b e l n -> (b e n) l')
+            h = _sequential_scan(a, bv)
+            h = rearrange(h, '(b e n) l -> b e l n', b=B, e=E, n=N)
 
-        y = torch.einsum('beln, bln -> bel', h, C_t)
-        y = y + u * self.D_skip.unsqueeze(0).unsqueeze(-1)
-        return list(rearrange(y, '(k b) e l -> k b e l', k=K).unbind(0))
+            y = torch.einsum('beln, bln -> bel', h, C_t)
+            y = y + u * D_skip
+            results.append(y)
+
+            del deltaA, deltaBx, a, bv, h
+
+        return results
