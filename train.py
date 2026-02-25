@@ -1,5 +1,6 @@
 """Training script for MambaTransformerDerain (multi-GPU + AMP for Kaggle)."""
 
+import math
 import os
 import random
 import numpy as np
@@ -102,9 +103,17 @@ def main():
         args.lambda_l1, args.lambda_ssim, args.lambda_edge).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6)
+
+    warmup = args.warmup_epochs
+    def lr_lambda(epoch):
+        if epoch < warmup:
+            return (epoch + 1) / warmup
+        progress = (epoch - warmup) / max(1, args.epochs - warmup)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = torch.GradScaler(device=device.type, enabled=use_amp)
+    print(f'LR: {args.lr} | Warmup: {warmup} epochs | then cosine decay')
 
     start_epoch = 0
     best_psnr = 0.0
@@ -135,8 +144,8 @@ def main():
             inp, tgt = inp.to(device), tgt.to(device)
 
             with torch.autocast(device_type=device.type, enabled=use_amp):
-                pred = model(inp).clamp(0, 1)
-                loss, l1, ssim_l, edge_l = criterion(pred, tgt)
+                pred = model(inp)
+                loss, l1, ssim_l, edge_l = criterion(pred.clamp(0, 1), tgt)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()

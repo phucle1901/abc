@@ -25,7 +25,9 @@ def get_config():
                         help='Patch size for cross-attention fusion')
 
     parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--lr', type=float, default=2e-4)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--warmup_epochs', type=int, default=15,
+                        help='Linear LR warmup epochs before cosine decay')
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--lambda_l1', type=float, default=1.0)
     parser.add_argument('--lambda_ssim', type=float, default=0.1)

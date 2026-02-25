@@ -171,6 +171,10 @@ class MambaTransformerDerain(nn.Module):
 
         self.apply(self._init_weights)
 
+        # Zero-init the output conv so the model starts as identity (pred ≈ inp).
+        nn.init.zeros_(self.output_conv.weight)
+        nn.init.zeros_(self.output_conv.bias)
+
     def enable_gradient_checkpointing(self):
         """Trade compute for memory: recompute activations during backward."""
         for stage in list(self.encoders) + [self.bottleneck] + list(self.decoders):
