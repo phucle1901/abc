@@ -1,8 +1,8 @@
 """
-MambaTransformerDerain – full U-Net with Hybrid Mamba-Transformer blocks.
+MambaTransformerDerain – full U-Net with Hybrid Mamba-ViT blocks.
 
 Macro:  4-level U-Net (3 encoder stages + bottleneck + 3 decoder stages).
-Micro:  Each HybridBlock = DWT → Mamba-LF ‖ Swin-HF → Cross-Attn Fusion → IDWT.
+Micro:  Each HybridBlock = DWT → Mamba-LF ‖ ViT-HF → Patch Cross-Attn Fusion → IDWT.
 Skip:   Gated Skip-Connections between encoder and decoder.
 """
 
@@ -14,7 +14,7 @@ from einops import rearrange
 from .ss2d import SS2D
 from .components import (
     HaarDWT2D, HaarIDWT2D,
-    SwinBlock, WindowCrossAttentionFusion,
+    ViTBlock, PatchCrossAttentionFusion,
     GatedSkipConnection, PatchMerging, Upsample,
 )
 
@@ -37,13 +37,11 @@ class VSSBlock(nn.Module):
         """x: (B, C, H, W) -> (B, C, H, W)."""
         B, C, H, W = x.shape
 
-        # SS2D with pre-norm
         x_ln = rearrange(x, 'b c h w -> b (h w) c')
         x_ln = self.norm1(x_ln)
         x_ln = rearrange(x_ln, 'b (h w) c -> b c h w', h=H, w=W)
         x = self.ss2d(x_ln) + x
 
-        # FFN with pre-norm
         x_flat = rearrange(x, 'b c h w -> b (h w) c')
         x_flat = self.mlp(self.norm2(x_flat)) + x_flat
         return rearrange(x_flat, 'b (h w) c -> b c h w', h=H, w=W)
@@ -52,30 +50,31 @@ class VSSBlock(nn.Module):
 # ======================== Hybrid Building Block ========================
 
 class HybridBlock(nn.Module):
-    """DWT → Mamba-LF branch ‖ Swin-HF branch → Fusion → IDWT.
+    """DWT → Mamba-LF branch ‖ ViT-HF branch → Patch Cross-Attn Fusion → IDWT.
 
-    Preserves spatial size: (B, C, H, W) → (B, C, H, W).
+    The HF band (3C channels from LH, HL, HH) is projected down to C channels
+    before the ViT and fusion, then projected back to 3C for IDWT reconstruction.
+    This keeps all heavy computation in C-dimensional space.
     """
 
-    def __init__(self, dim, num_heads, window_size=8,
+    def __init__(self, dim, num_heads, patch_size=8,
                  d_state=16, d_conv=3, ssm_expand=2, mlp_ratio=4.0):
         super().__init__()
         self.dwt = HaarDWT2D()
         self.idwt = HaarIDWT2D()
 
-        hf_dim = dim * 3
-
         self.mamba_branch = VSSBlock(dim, d_state, d_conv, ssm_expand, mlp_ratio)
-        self.swin_branch = SwinBlock(hf_dim, num_heads, window_size, mlp_ratio)
-        self.fusion = WindowCrossAttentionFusion(
-            lf_dim=dim, hf_dim=hf_dim,
-            num_heads=num_heads, window_size=window_size)
+
+        self.hf_proj_in = nn.Linear(dim * 3, dim)
+        self.vit_branch = ViTBlock(dim, num_heads, mlp_ratio)
+        self.hf_proj_out = nn.Linear(dim, dim * 3)
+
+        self.fusion = PatchCrossAttentionFusion(dim, num_heads, patch_size)
 
     def forward(self, x):
         identity = x
         B, C, H, W = x.shape
 
-        # pad to even for DWT
         pad_h, pad_w = H % 2, W % 2
         if pad_h or pad_w:
             x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
@@ -85,11 +84,22 @@ class HybridBlock(nn.Module):
         x_hf = torch.cat([LH, HL, HH], dim=1)
 
         y_lf = self.mamba_branch(x_lf)
-        y_hf = self.swin_branch(x_hf)
+
+        _, _, Hd, Wd = x_hf.shape
+        x_hf_proj = rearrange(x_hf, 'b c h w -> b (h w) c')
+        x_hf_proj = self.hf_proj_in(x_hf_proj)
+        x_hf_proj = rearrange(x_hf_proj, 'b n c -> b c n')
+        x_hf_proj = x_hf_proj.view(B, C, Hd, Wd)
+        y_hf = self.vit_branch(x_hf_proj)
 
         y_fused = self.fusion(y_lf, y_hf)
-        LH_o, HL_o, HH_o = y_fused.chunk(3, dim=1)
 
+        y_fused = rearrange(y_fused, 'b c h w -> b (h w) c')
+        y_fused = self.hf_proj_out(y_fused)
+        y_fused = rearrange(y_fused, 'b n c -> b c n')
+        y_fused = y_fused.view(B, C * 3, Hd, Wd)
+
+        LH_o, HL_o, HH_o = y_fused.chunk(3, dim=1)
         out = self.idwt(y_lf, LH_o, HL_o, HH_o)
         out = out[:, :, :H, :W]
         return out + identity
@@ -98,10 +108,10 @@ class HybridBlock(nn.Module):
 # ======================== Stage (sequence of HybridBlocks) ========================
 
 class Stage(nn.Module):
-    def __init__(self, dim, depth, num_heads, window_size=8, **kw):
+    def __init__(self, dim, depth, num_heads, patch_size=8, **kw):
         super().__init__()
         self.blocks = nn.ModuleList([
-            HybridBlock(dim, num_heads, window_size, **kw)
+            HybridBlock(dim, num_heads, patch_size, **kw)
             for _ in range(depth)])
 
     def forward(self, x):
@@ -114,40 +124,36 @@ class Stage(nn.Module):
 
 class MambaTransformerDerain(nn.Module):
     """
-    4-level U-Net with Mamba-Transformer hybrid blocks.
+    4-level U-Net with Mamba-ViT hybrid blocks.
 
     Channel progression:  C → 2C → 4C → 8C (bottleneck) → 4C → 2C → C
     """
 
     def __init__(self, in_chans=3, base_dim=48,
-                 num_blocks=(1, 1, 1, 1),
+                 num_blocks=(2, 2, 2, 2),
                  d_state=16, d_conv=3, ssm_expand=2,
-                 window_size=8, mlp_ratio=4.0):
+                 patch_size=8, mlp_ratio=4.0):
         super().__init__()
-        dims = [base_dim * (2 ** i) for i in range(4)]  # [C, 2C, 4C, 8C]
+        dims = [base_dim * (2 ** i) for i in range(4)]
 
         def _heads(d):
-            return max(1, (d * 3) // 24)
+            return max(1, d // 16)
 
         kw = dict(d_state=d_state, d_conv=d_conv,
                   ssm_expand=ssm_expand, mlp_ratio=mlp_ratio)
 
-        # --- shallow feature extraction ---
         self.shallow = nn.Conv2d(in_chans, dims[0], 3, padding=1)
 
-        # --- encoder ---
         self.encoders = nn.ModuleList()
         self.downsamples = nn.ModuleList()
         for i in range(3):
             self.encoders.append(
-                Stage(dims[i], num_blocks[i], _heads(dims[i]), window_size, **kw))
+                Stage(dims[i], num_blocks[i], _heads(dims[i]), patch_size, **kw))
             self.downsamples.append(PatchMerging(dims[i]))
 
-        # --- bottleneck ---
         self.bottleneck = Stage(
-            dims[3], num_blocks[3], _heads(dims[3]), window_size, **kw)
+            dims[3], num_blocks[3], _heads(dims[3]), patch_size, **kw)
 
-        # --- decoder ---
         self.upsamples = nn.ModuleList()
         self.gates = nn.ModuleList()
         self.decoders = nn.ModuleList()
@@ -155,9 +161,8 @@ class MambaTransformerDerain(nn.Module):
             self.upsamples.append(Upsample(dims[i + 1], dims[i]))
             self.gates.append(GatedSkipConnection(dims[i]))
             self.decoders.append(
-                Stage(dims[i], num_blocks[i], _heads(dims[i]), window_size, **kw))
+                Stage(dims[i], num_blocks[i], _heads(dims[i]), patch_size, **kw))
 
-        # --- reconstruction ---
         self.output_conv = nn.Conv2d(dims[0], in_chans, 3, padding=1)
 
         self.apply(self._init_weights)
@@ -179,7 +184,6 @@ class MambaTransformerDerain(nn.Module):
 
         x = self.shallow(x)
 
-        # encoder
         skips = []
         for enc, down in zip(self.encoders, self.downsamples):
             x = enc(x)
@@ -188,11 +192,9 @@ class MambaTransformerDerain(nn.Module):
 
         x = self.bottleneck(x)
 
-        # decoder
         for up, gate, dec, skip in zip(
                 self.upsamples, self.gates, self.decoders, reversed(skips)):
             x = up(x)
-            # handle size mismatch after upsample
             if x.shape[2:] != skip.shape[2:]:
                 x = F.interpolate(x, size=skip.shape[2:], mode='bilinear',
                                   align_corners=False)

@@ -19,10 +19,10 @@ def main():
     parser.add_argument('--target_dir', type=str, default='Rain100L/target')
     parser.add_argument('--output_dir', type=str, default='results')
     parser.add_argument('--base_channels', type=int, default=48)
-    parser.add_argument('--num_blocks', type=int, nargs='+', default=[1, 1, 1, 1])
+    parser.add_argument('--num_blocks', type=int, nargs='+', default=[2, 2, 2, 2])
     parser.add_argument('--d_state', type=int, default=16)
     parser.add_argument('--ssm_expand', type=int, default=2)
-    parser.add_argument('--window_size', type=int, default=8)
+    parser.add_argument('--fusion_patch_size', type=int, default=8)
     parser.add_argument('--save_images', action='store_true')
     args = parser.parse_args()
 
@@ -34,7 +34,7 @@ def main():
         num_blocks=args.num_blocks,
         d_state=args.d_state,
         ssm_expand=args.ssm_expand,
-        window_size=args.window_size,
+        patch_size=args.fusion_patch_size,
     ).to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)

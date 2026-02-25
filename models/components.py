@@ -1,6 +1,6 @@
 """
-Building blocks: Haar DWT/IDWT, Window Attention, Swin HF Block,
-Window Cross-Attention Fusion, Gated Skip Connection, Patch Merging, Upsample.
+Building blocks: Haar DWT/IDWT, Standard ViT Block, Patch-based Cross-Attention
+Fusion, Gated Skip Connection, Patch Merging, Upsample.
 """
 
 import torch
@@ -45,7 +45,17 @@ class HaarIDWT2D(nn.Module):
         return x
 
 
-# ======================== Window Utilities ========================
+# ======================== Utility ========================
+
+def _pad_to(x, divisor):
+    """Pad spatial dims of (B, C, H, W) so they are divisible by *divisor*."""
+    _, _, H, W = x.shape
+    pad_h = (divisor - H % divisor) % divisor
+    pad_w = (divisor - W % divisor) % divisor
+    if pad_h or pad_w:
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+    return x, H, W
+
 
 def window_partition(x, window_size):
     """Partition feature map into non-overlapping windows.
@@ -76,83 +86,18 @@ def window_reverse(windows, window_size, H, W):
     return x.permute(0, 3, 1, 4, 2, 5).contiguous().view(B, -1, H, W)
 
 
-def _pad_to(x, divisor):
-    """Pad spatial dims of (B, C, H, W) so they are divisible by *divisor*."""
-    _, _, H, W = x.shape
-    pad_h = (divisor - H % divisor) % divisor
-    pad_w = (divisor - W % divisor) % divisor
-    if pad_h or pad_w:
-        x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
-    return x, H, W
+# ======================== Standard ViT Block ========================
 
+class ViTBlock(nn.Module):
+    """Standard Vision Transformer block: global Multi-head Self-Attention + FFN.
 
-# ======================== Relative Position Bias ========================
+    Uses ``nn.MultiheadAttention`` from PyTorch for the attention computation.
+    """
 
-class RelativePositionBias(nn.Module):
-    def __init__(self, window_size, num_heads):
+    def __init__(self, dim, num_heads, mlp_ratio=4.0):
         super().__init__()
-        self.window_size = window_size
-        self.num_heads = num_heads
-
-        self.table = nn.Parameter(
-            torch.zeros((2 * window_size - 1) ** 2, num_heads))
-        nn.init.trunc_normal_(self.table, std=0.02)
-
-        coords = torch.stack(torch.meshgrid(
-            torch.arange(window_size), torch.arange(window_size), indexing='ij'))
-        coords_flat = coords.flatten(1)
-        rel = coords_flat[:, :, None] - coords_flat[:, None, :]
-        rel = rel.permute(1, 2, 0).contiguous()
-        rel[:, :, 0] += window_size - 1
-        rel[:, :, 1] += window_size - 1
-        rel[:, :, 0] *= 2 * window_size - 1
-        self.register_buffer('index', rel.sum(-1))
-
-    def forward(self):
-        """Returns (num_heads, ws*ws, ws*ws)."""
-        N = self.window_size * self.window_size
-        bias = self.table[self.index.view(-1)].view(N, N, -1)
-        return bias.permute(2, 0, 1).contiguous()
-
-
-# ======================== Window Self-Attention (for HF) ========================
-
-class WindowSelfAttention(nn.Module):
-    """W-MSA inside a single window."""
-
-    def __init__(self, dim, num_heads, window_size):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-        self.rpb = RelativePositionBias(window_size, num_heads)
-
-    def forward(self, x):
-        """x: (num_win, N, C) where N = ws*ws."""
-        BW, N, C = x.shape
-        qkv = self.qkv(x).reshape(BW, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn + self.rpb().unsqueeze(0)
-        attn = F.softmax(attn, dim=-1)
-
-        out = (attn @ v).transpose(1, 2).reshape(BW, N, C)
-        return self.proj(out)
-
-
-class SwinBlock(nn.Module):
-    """Swin Transformer block (W-MSA + FFN) for the HF branch."""
-
-    def __init__(self, dim, num_heads, window_size=8, mlp_ratio=4.0):
-        super().__init__()
-        self.window_size = window_size
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = WindowSelfAttention(dim, num_heads, window_size)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
         hidden = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
@@ -161,75 +106,71 @@ class SwinBlock(nn.Module):
     def forward(self, x):
         """x: (B, C, H, W) -> (B, C, H, W)."""
         B, C, H, W = x.shape
-        ws = self.window_size
-        x, orig_H, orig_W = _pad_to(x, ws)
-        _, _, Hp, Wp = x.shape
+        tokens = rearrange(x, 'b c h w -> b (h w) c')
 
-        wins = window_partition(x, ws)
-        tokens = rearrange(wins, 'bw c h w -> bw (h w) c')
+        normed = self.norm1(tokens)
+        attn_out, _ = self.attn(normed, normed, normed)
+        tokens = tokens + attn_out
 
-        tokens = self.attn(self.norm1(tokens)) + tokens
-        tokens = self.mlp(self.norm2(tokens)) + tokens
-
-        wins = rearrange(tokens, 'bw (h w) c -> bw c h w', h=ws, w=ws)
-        x = window_reverse(wins, ws, Hp, Wp)
-        return x[:, :, :orig_H, :orig_W]
+        tokens = tokens + self.mlp(self.norm2(tokens))
+        return rearrange(tokens, 'b (h w) c -> b c h w', h=H, w=W)
 
 
-# ======================== Window Cross-Attention Fusion ========================
+# ======================== Patch-based Cross-Attention Fusion ========================
 
-class WindowCrossAttentionFusion(nn.Module):
-    """Cross-Attention: Q from LF (C), K/V from HF (3C).
+class PatchCrossAttentionFusion(nn.Module):
+    """Patch-based cross-attention: Q from LF context, K/V from HF detail.
 
-    Output has shape of HF (3C) with residual skip from HF.
+    Both inputs share the same channel dimension (projected to C).
+    Non-overlapping patches of size ``patch_size`` keep computation bounded.
+    Uses ``nn.MultiheadAttention`` from PyTorch internally.
     """
 
-    def __init__(self, lf_dim, hf_dim, num_heads, window_size=8):
+    def __init__(self, dim, num_heads, patch_size=8):
         super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = hf_dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.window_size = window_size
-
-        self.q_proj = nn.Linear(lf_dim, hf_dim)
-        self.k_proj = nn.Linear(hf_dim, hf_dim)
-        self.v_proj = nn.Linear(hf_dim, hf_dim)
-        self.out_proj = nn.Linear(hf_dim, hf_dim)
-
-        self.norm_lf = nn.LayerNorm(lf_dim)
-        self.norm_hf = nn.LayerNorm(hf_dim)
-        self.rpb = RelativePositionBias(window_size, num_heads)
+        self.patch_size = patch_size
+        self.norm_lf = nn.LayerNorm(dim)
+        self.norm_hf = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
 
     def forward(self, y_lf, y_hf):
-        """y_lf: (B, C, H, W), y_hf: (B, 3C, H, W) -> (B, 3C, H, W)."""
-        B, C_lf, H, W = y_lf.shape
-        C_hf = y_hf.shape[1]
-        ws = self.window_size
+        """y_lf, y_hf: (B, C, H, W) -> (B, C, H, W)."""
+        B, C, H, W = y_lf.shape
+        ps = self.patch_size
 
-        y_lf, orig_H, orig_W = _pad_to(y_lf, ws)
-        y_hf, _, _ = _pad_to(y_hf, ws)
+        if H < ps or W < ps:
+            lf_tokens = rearrange(y_lf, 'b c h w -> b (h w) c')
+            hf_tokens = rearrange(y_hf, 'b c h w -> b (h w) c')
+            hf_residual = hf_tokens
+            out, _ = self.cross_attn(
+                self.norm_lf(lf_tokens),
+                self.norm_hf(hf_tokens),
+                hf_tokens,
+            )
+            out = out + hf_residual
+            return rearrange(out, 'b (h w) c -> b c h w', h=H, w=W)
+
+        y_lf, orig_H, orig_W = _pad_to(y_lf, ps)
+        y_hf, _, _ = _pad_to(y_hf, ps)
         _, _, Hp, Wp = y_lf.shape
-        N = ws * ws
 
-        lf_w = rearrange(window_partition(y_lf, ws), 'bw c h w -> bw (h w) c')
-        hf_w = rearrange(window_partition(y_hf, ws), 'bw c h w -> bw (h w) c')
+        lf_patches = window_partition(y_lf, ps)
+        hf_patches = window_partition(y_hf, ps)
 
-        hf_residual = hf_w
-        lf_w = self.norm_lf(lf_w)
-        hf_w = self.norm_hf(hf_w)
+        lf_tokens = rearrange(lf_patches, 'bw c h w -> bw (h w) c')
+        hf_tokens = rearrange(hf_patches, 'bw c h w -> bw (h w) c')
 
-        Q = self.q_proj(lf_w).reshape(-1, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        K = self.k_proj(hf_w).reshape(-1, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        V = self.v_proj(hf_w).reshape(-1, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        hf_residual = hf_tokens
 
-        attn = (Q @ K.transpose(-2, -1)) * self.scale
-        attn = attn + self.rpb().unsqueeze(0)
-        attn = F.softmax(attn, dim=-1)
-        out = (attn @ V).transpose(1, 2).reshape(-1, N, C_hf)
-        out = self.out_proj(out) + hf_residual
+        out, _ = self.cross_attn(
+            self.norm_lf(lf_tokens),
+            self.norm_hf(hf_tokens),
+            hf_tokens,
+        )
+        out = out + hf_residual
 
-        wins = rearrange(out, 'bw (h w) c -> bw c h w', h=ws, w=ws)
-        out = window_reverse(wins, ws, Hp, Wp)
+        out = rearrange(out, 'bw (h w) c -> bw c h w', h=ps, w=ps)
+        out = window_reverse(out, ps, Hp, Wp)
         return out[:, :, :orig_H, :orig_W]
 
 

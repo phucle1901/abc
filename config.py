@@ -15,21 +15,21 @@ def get_config():
     parser.add_argument('--num_workers', type=int, default=4)
 
     parser.add_argument('--base_channels', type=int, default=48)
-    parser.add_argument('--num_blocks', type=int, nargs='+', default=[1, 1, 1, 1],
+    parser.add_argument('--num_blocks', type=int, nargs='+', default=[2, 2, 2, 2],
                         help='Number of HybridBlocks per stage (enc1, enc2, enc3, bottleneck)')
     parser.add_argument('--d_state', type=int, default=16,
                         help='SSM state dimension for Mamba')
     parser.add_argument('--ssm_expand', type=int, default=2,
                         help='Expansion factor in SS2D')
-    parser.add_argument('--window_size', type=int, default=8,
-                        help='Window size for Swin attention and fusion')
+    parser.add_argument('--fusion_patch_size', type=int, default=8,
+                        help='Patch size for cross-attention fusion')
 
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--lambda_l1', type=float, default=1.0)
     parser.add_argument('--lambda_ssim', type=float, default=0.1)
-    parser.add_argument('--lambda_perceptual', type=float, default=0.04)
+    parser.add_argument('--lambda_edge', type=float, default=0.1)
 
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--log_dir', type=str, default='logs')

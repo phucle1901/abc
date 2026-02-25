@@ -75,7 +75,7 @@ def main():
         num_blocks=args.num_blocks,
         d_state=args.d_state,
         ssm_expand=args.ssm_expand,
-        window_size=args.window_size,
+        patch_size=args.fusion_patch_size,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -83,7 +83,7 @@ def main():
 
     # ---- loss / optim / scheduler ----
     criterion = CombinedLoss(
-        args.lambda_l1, args.lambda_ssim, args.lambda_perceptual).to(device)
+        args.lambda_l1, args.lambda_ssim, args.lambda_edge).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -120,7 +120,7 @@ def main():
 
             with torch.autocast(device_type=device.type, enabled=use_amp):
                 pred = model(inp).clamp(0, 1)
-                loss, l1, ssim_l, perc = criterion(pred, tgt)
+                loss, l1, ssim_l, edge_l = criterion(pred, tgt)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -132,7 +132,8 @@ def main():
             epoch_loss += loss.item()
             pbar.set_postfix(loss=f'{loss.item():.4f}',
                              l1=f'{l1.item():.4f}',
-                             ssim=f'{ssim_l.item():.4f}')
+                             ssim=f'{ssim_l.item():.4f}',
+                             edge=f'{edge_l.item():.4f}')
 
         scheduler.step()
         avg_loss = epoch_loss / max(len(train_loader), 1)

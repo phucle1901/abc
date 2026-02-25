@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Training artifacts
+checkpoints/
+logs/
+results/
+
+# Dataset (too large for git)
+Rain100L/
+data/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
