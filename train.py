@@ -187,14 +187,14 @@ def main():
                 'best_psnr': best_psnr,
             }, os.path.join(args.save_dir, 'best.pth'))
 
-        if (epoch + 1) % 50 == 0:
-            torch.save({
-                'epoch': epoch,
-                'model': _unwrap(model).state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'best_psnr': best_psnr,
-            }, os.path.join(args.save_dir, f'epoch_{epoch+1}.pth'))
+        # Save checkpoint every epoch
+        torch.save({
+            'epoch': epoch,
+            'model': _unwrap(model).state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'best_psnr': best_psnr,
+        }, os.path.join(args.save_dir, f'epoch_{epoch+1}.pth'))
 
     writer.close()
     print(f'Training complete.  Best PSNR: {best_psnr:.2f} dB')
