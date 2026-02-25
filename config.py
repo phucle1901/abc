@@ -11,8 +11,8 @@ def get_config():
                         help='Fraction of data used for training')
     parser.add_argument('--patch_size', type=int, default=128,
                         help='Training patch size (must be divisible by 16)')
-    parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=2)
 
     parser.add_argument('--base_channels', type=int, default=48)
     parser.add_argument('--num_blocks', type=int, nargs='+', default=[2, 2, 2, 2],
