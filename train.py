@@ -84,7 +84,7 @@ def main():
         patch_size=args.fusion_patch_size,
     )
 
-    if args.grad_checkpoint:
+    if not args.no_grad_checkpoint:
         model.enable_gradient_checkpointing()
         print('Gradient checkpointing: ENABLED')
 

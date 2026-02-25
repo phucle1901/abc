@@ -11,7 +11,7 @@ def get_config():
                         help='Fraction of data used for training')
     parser.add_argument('--patch_size', type=int, default=128,
                         help='Training patch size (must be divisible by 16)')
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--num_workers', type=int, default=4)
 
     parser.add_argument('--base_channels', type=int, default=48)
@@ -31,8 +31,8 @@ def get_config():
     parser.add_argument('--lambda_ssim', type=float, default=0.1)
     parser.add_argument('--lambda_edge', type=float, default=0.1)
 
-    parser.add_argument('--grad_checkpoint', action='store_true',
-                        help='Enable gradient checkpointing to reduce GPU memory')
+    parser.add_argument('--no_grad_checkpoint', action='store_true',
+                        help='Disable gradient checkpointing (uses more GPU memory)')
 
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--log_dir', type=str, default='logs')
