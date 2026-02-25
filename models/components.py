@@ -91,13 +91,20 @@ def window_reverse(windows, window_size, H, W):
 class ViTBlock(nn.Module):
     """Standard Vision Transformer block: global Multi-head Self-Attention + FFN.
 
-    Uses ``nn.MultiheadAttention`` from PyTorch for the attention computation.
+    Uses ``F.scaled_dot_product_attention`` (PyTorch >= 2.0) which automatically
+    selects the most memory-efficient backend (Flash Attention / Memory-Efficient
+    Attention) on CUDA.
     """
 
     def __init__(self, dim, num_heads, mlp_ratio=4.0):
         super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+
         self.norm2 = nn.LayerNorm(dim)
         hidden = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
@@ -106,11 +113,16 @@ class ViTBlock(nn.Module):
     def forward(self, x):
         """x: (B, C, H, W) -> (B, C, H, W)."""
         B, C, H, W = x.shape
+        N = H * W
         tokens = rearrange(x, 'b c h w -> b (h w) c')
 
         normed = self.norm1(tokens)
-        attn_out, _ = self.attn(normed, normed, normed)
-        tokens = tokens + attn_out
+        qkv = self.qkv(normed).reshape(B, N, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v)
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, C)
+        tokens = tokens + self.proj(attn_out)
 
         tokens = tokens + self.mlp(self.norm2(tokens))
         return rearrange(tokens, 'b (h w) c -> b c h w', h=H, w=W)
@@ -123,15 +135,36 @@ class PatchCrossAttentionFusion(nn.Module):
 
     Both inputs share the same channel dimension (projected to C).
     Non-overlapping patches of size ``patch_size`` keep computation bounded.
-    Uses ``nn.MultiheadAttention`` from PyTorch internally.
+    Uses ``F.scaled_dot_product_attention`` for memory-efficient attention.
     """
 
     def __init__(self, dim, num_heads, patch_size=8):
         super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
         self.patch_size = patch_size
+
         self.norm_lf = nn.LayerNorm(dim)
         self.norm_hf = nn.LayerNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.q_proj = nn.Linear(dim, dim)
+        self.kv_proj = nn.Linear(dim, dim * 2)
+        self.out_proj = nn.Linear(dim, dim)
+
+    def _cross_attn(self, lf_tokens, hf_tokens):
+        """Apply cross-attention: Q from LF, K/V from HF, residual from HF."""
+        BW, N, C = lf_tokens.shape
+        hf_residual = hf_tokens
+
+        q = self.q_proj(self.norm_lf(lf_tokens))
+        q = q.reshape(BW, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+        hf_normed = self.norm_hf(hf_tokens)
+        kv = self.kv_proj(hf_normed).reshape(BW, N, 2, self.num_heads, self.head_dim)
+        k, v = kv.permute(2, 0, 3, 1, 4).unbind(0)
+
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(1, 2).reshape(BW, N, C)
+        return self.out_proj(out) + hf_residual
 
     def forward(self, y_lf, y_hf):
         """y_lf, y_hf: (B, C, H, W) -> (B, C, H, W)."""
@@ -141,33 +174,17 @@ class PatchCrossAttentionFusion(nn.Module):
         if H < ps or W < ps:
             lf_tokens = rearrange(y_lf, 'b c h w -> b (h w) c')
             hf_tokens = rearrange(y_hf, 'b c h w -> b (h w) c')
-            hf_residual = hf_tokens
-            out, _ = self.cross_attn(
-                self.norm_lf(lf_tokens),
-                self.norm_hf(hf_tokens),
-                hf_tokens,
-            )
-            out = out + hf_residual
+            out = self._cross_attn(lf_tokens, hf_tokens)
             return rearrange(out, 'b (h w) c -> b c h w', h=H, w=W)
 
         y_lf, orig_H, orig_W = _pad_to(y_lf, ps)
         y_hf, _, _ = _pad_to(y_hf, ps)
         _, _, Hp, Wp = y_lf.shape
 
-        lf_patches = window_partition(y_lf, ps)
-        hf_patches = window_partition(y_hf, ps)
+        lf_tokens = rearrange(window_partition(y_lf, ps), 'bw c h w -> bw (h w) c')
+        hf_tokens = rearrange(window_partition(y_hf, ps), 'bw c h w -> bw (h w) c')
 
-        lf_tokens = rearrange(lf_patches, 'bw c h w -> bw (h w) c')
-        hf_tokens = rearrange(hf_patches, 'bw c h w -> bw (h w) c')
-
-        hf_residual = hf_tokens
-
-        out, _ = self.cross_attn(
-            self.norm_lf(lf_tokens),
-            self.norm_hf(hf_tokens),
-            hf_tokens,
-        )
-        out = out + hf_residual
+        out = self._cross_attn(lf_tokens, hf_tokens)
 
         out = rearrange(out, 'bw (h w) c -> bw c h w', h=ps, w=ps)
         out = window_reverse(out, ps, Hp, Wp)
