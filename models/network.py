@@ -113,10 +113,14 @@ class Stage(nn.Module):
         self.blocks = nn.ModuleList([
             HybridBlock(dim, num_heads, patch_size, **kw)
             for _ in range(depth)])
+        self.use_checkpoint = False
 
     def forward(self, x):
         for blk in self.blocks:
-            x = blk(x)
+            if self.use_checkpoint and self.training:
+                x = torch.utils.checkpoint.checkpoint(blk, x, use_reentrant=False)
+            else:
+                x = blk(x)
         return x
 
 
@@ -166,6 +170,11 @@ class MambaTransformerDerain(nn.Module):
         self.output_conv = nn.Conv2d(dims[0], in_chans, 3, padding=1)
 
         self.apply(self._init_weights)
+
+    def enable_gradient_checkpointing(self):
+        """Trade compute for memory: recompute activations during backward."""
+        for stage in list(self.encoders) + [self.bottleneck] + list(self.decoders):
+            stage.use_checkpoint = True
 
     @staticmethod
     def _init_weights(m):

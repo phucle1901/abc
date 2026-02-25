@@ -1,4 +1,4 @@
-"""Training script for MambaTransformerDerain (with AMP for Kaggle GPU)."""
+"""Training script for MambaTransformerDerain (multi-GPU + AMP for Kaggle)."""
 
 import os
 import random
@@ -21,6 +21,11 @@ def seed_everything(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _unwrap(model):
+    """Get the underlying model from DataParallel wrapper."""
+    return model.module if isinstance(model, nn.DataParallel) else model
 
 
 @torch.no_grad()
@@ -50,7 +55,8 @@ def main():
     seed_everything(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = device.type == 'cuda'
-    print(f'Device: {device} | AMP: {use_amp}')
+    n_gpus = torch.cuda.device_count()
+    print(f'Device: {device} | GPUs: {n_gpus} | AMP: {use_amp}')
 
     try:
         from mamba_ssm.ops.selective_scan_interface import selective_scan_fn  # noqa: F401
@@ -76,7 +82,17 @@ def main():
         d_state=args.d_state,
         ssm_expand=args.ssm_expand,
         patch_size=args.fusion_patch_size,
-    ).to(device)
+    )
+
+    if args.grad_checkpoint:
+        model.enable_gradient_checkpointing()
+        print('Gradient checkpointing: ENABLED')
+
+    model = model.to(device)
+
+    if n_gpus > 1:
+        model = nn.DataParallel(model)
+        print(f'DataParallel: using {n_gpus} GPUs')
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'Parameters: {n_params / 1e6:.2f} M')
@@ -96,7 +112,7 @@ def main():
     # ---- resume ----
     if args.resume and os.path.isfile(args.resume):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt['model'])
+        _unwrap(model).load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         scheduler.load_state_dict(ckpt['scheduler'])
         start_epoch = ckpt['epoch'] + 1
@@ -151,7 +167,7 @@ def main():
                 best_psnr = psnr
                 torch.save({
                     'epoch': epoch,
-                    'model': model.state_dict(),
+                    'model': _unwrap(model).state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                     'best_psnr': best_psnr,
@@ -160,7 +176,7 @@ def main():
         if (epoch + 1) % 50 == 0:
             torch.save({
                 'epoch': epoch,
-                'model': model.state_dict(),
+                'model': _unwrap(model).state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
                 'best_psnr': best_psnr,

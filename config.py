@@ -31,6 +31,9 @@ def get_config():
     parser.add_argument('--lambda_ssim', type=float, default=0.1)
     parser.add_argument('--lambda_edge', type=float, default=0.1)
 
+    parser.add_argument('--grad_checkpoint', action='store_true',
+                        help='Enable gradient checkpointing to reduce GPU memory')
+
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--log_dir', type=str, default='logs')
     parser.add_argument('--resume', type=str, default=None,
