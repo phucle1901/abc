@@ -52,6 +52,8 @@ def main():
 
     with torch.no_grad():
         for i, (inp, tgt) in enumerate(tqdm(loader, desc='Testing')):
+            if i>5:
+                break
             inp, tgt = inp.to(device), tgt.to(device)
             _, _, H, W = inp.shape
 
