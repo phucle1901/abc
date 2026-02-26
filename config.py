@@ -14,6 +14,9 @@ def get_config():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=2)
 
+    parser.add_argument('--eval_interval', type=int, default=5,
+                        help='Run evaluation every N epochs (1 = every epoch)')
+
     parser.add_argument('--base_channels', type=int, default=48)
     parser.add_argument('--num_blocks', type=int, nargs='+', default=[2, 2, 2, 2],
                         help='Number of HybridBlocks per stage (enc1, enc2, enc3, bottleneck)')

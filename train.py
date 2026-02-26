@@ -165,27 +165,29 @@ def main():
         writer.add_scalar('train/loss', avg_loss, epoch)
         writer.add_scalar('train/lr', scheduler.get_last_lr()[0], epoch)
 
-        # ---- evaluate on train + val ----
-        train_psnr, train_ssim = evaluate(model, train_loader, device, use_amp)
-        val_psnr, val_ssim = evaluate(model, val_loader, device, use_amp)
+        # ---- evaluate on train + val (every eval_interval epochs) ----
+        do_eval = ((epoch + 1) % args.eval_interval == 0) or (epoch == args.epochs - 1)
+        if do_eval:
+            train_psnr, train_ssim = evaluate(model, train_loader, device, use_amp)
+            val_psnr, val_ssim = evaluate(model, val_loader, device, use_amp)
 
-        writer.add_scalar('train/psnr', train_psnr, epoch)
-        writer.add_scalar('train/ssim', train_ssim, epoch)
-        writer.add_scalar('val/psnr', val_psnr, epoch)
-        writer.add_scalar('val/ssim', val_ssim, epoch)
+            writer.add_scalar('train/psnr', train_psnr, epoch)
+            writer.add_scalar('train/ssim', train_ssim, epoch)
+            writer.add_scalar('val/psnr', val_psnr, epoch)
+            writer.add_scalar('val/ssim', val_ssim, epoch)
 
-        print(f'  Train PSNR: {train_psnr:.2f} dB | SSIM: {train_ssim:.4f}')
-        print(f'  Val   PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}')
+            print(f'  Train PSNR: {train_psnr:.2f} dB | SSIM: {train_ssim:.4f}')
+            print(f'  Val   PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}')
 
-        if val_psnr > best_psnr:
-            best_psnr = val_psnr
-            torch.save({
-                'epoch': epoch,
-                'model': _unwrap(model).state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'best_psnr': best_psnr,
-            }, os.path.join(args.save_dir, 'best.pth'))
+            if val_psnr > best_psnr:
+                best_psnr = val_psnr
+                torch.save({
+                    'epoch': epoch,
+                    'model': _unwrap(model).state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'best_psnr': best_psnr,
+                }, os.path.join(args.save_dir, 'best.pth'))
 
         # Save checkpoint every epoch
         torch.save({

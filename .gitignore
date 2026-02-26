@@ -13,7 +13,7 @@ results/
 # Dataset (too large for git)
 Rain100L/
 data/
-
+Rain100H/
 # IDE / OS
 .vscode/
 .idea/
